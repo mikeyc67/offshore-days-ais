@@ -12,6 +12,10 @@ const KEY = process.env.AISSTREAM_KEY;
 const LISTEN_MS = Number(process.env.LISTEN_SECONDS || 150) * 1000;
 const PORT_RADIUS_NM = 4;
 
+// never let one odd message end the whole run
+process.on('unhandledRejection', e => console.error('Ignored an unexpected error:', e?.message || e));
+process.on('uncaughtException', e => console.error('Ignored an unexpected error:', e?.message || e));
+
 if (!KEY) throw new Error('AISSTREAM_KEY secret is missing (GitHub → Settings → Secrets and variables → Actions).');
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error('FIREBASE_SERVICE_ACCOUNT secret is missing.');
 initializeApp({ credential: cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
@@ -50,6 +54,8 @@ function aisTime(s) {
 }
 
 // ---- listen to aisstream for these MMSIs until each has reported a position, or time runs out ----
+const seen = new Set();   // message types received, for the log
+let refused = '';          // aisstream's reason, if it turned the connection down
 function listen(mmsis) {
   return new Promise(resolve => {
     const got = new Map();
@@ -64,18 +70,27 @@ function listen(mmsis) {
       FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ShipStaticData'],
     }));
     ws.onmessage = async ev => {
-      const text = typeof ev.data === 'string' ? ev.data : await new Response(ev.data).text();
-      let m; try { m = JSON.parse(text); } catch { return; }
-      if (m.error) { console.error('aisstream refused the connection:', m.error); return finish(); }
-      const mmsi = String(m.MetaData?.MMSI ?? '');
-      const g = got.get(mmsi) || {};
-      if (m.MessageType === 'ShipStaticData') g.dest = (m.Message.ShipStaticData.Destination || '').trim();
-      else {
-        const p = m.Message[m.MessageType];
-        g.pos = { lat: p.Latitude, lon: p.Longitude, sog: p.Sog ?? null, nav: p.NavigationalStatus ?? null, t: aisTime(m.MetaData?.time_utc) };
+      try {
+        const text = typeof ev.data === 'string' ? ev.data : await new Response(ev.data).text();
+        let m; try { m = JSON.parse(text); } catch { return; }
+        if (m.error) { refused = String(m.error); console.error('aisstream refused the connection:', m.error); return finish(); }
+        seen.add(m.MessageType || '?');
+        const mmsi = String(m.MetaData?.MMSI ?? m.MetaData?.MMSI_String ?? '');
+        const g = got.get(mmsi) || {};
+        // the report itself is usually under Message[MessageType]; MetaData also carries a latitude/longitude
+        const body = m.Message?.[m.MessageType] ?? Object.values(m.Message || {})[0] ?? {};
+        if (typeof body.Destination === 'string') g.dest = body.Destination.trim();
+        const lat = typeof body.Latitude === 'number' ? body.Latitude : m.MetaData?.latitude;
+        const lon = typeof body.Longitude === 'number' ? body.Longitude : m.MetaData?.longitude;
+        // 91 / 181 mean "position not available" in AIS
+        if (m.MessageType !== 'ShipStaticData' && typeof lat === 'number' && typeof lon === 'number' && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && !(lat === 0 && lon === 0)) {
+          g.pos = { lat, lon, sog: typeof body.Sog === 'number' ? body.Sog : null, nav: body.NavigationalStatus ?? null, t: aisTime(m.MetaData?.time_utc) };
+        }
+        got.set(mmsi, g);
+        if (mmsis.every(x => got.get(x)?.pos)) finish();
+      } catch (e) {
+        console.error('Skipped an AIS message that could not be read:', e.message);
       }
-      got.set(mmsi, g);
-      if (mmsis.every(x => got.get(x)?.pos)) finish();
     };
     ws.onerror = e => console.error('Connection problem:', e?.message || e);
     ws.onclose = finish;
@@ -94,14 +109,19 @@ if (!tracks.length) { console.log('Nobody has tracking switched on. Nothing to d
 
 const mmsis = [...new Set(tracks.map(t => t.cfg.mmsi))];
 console.log(`Listening up to ${LISTEN_MS / 1000}s for ${mmsis.length} vessel(s)…`);
-const got = await listen(mmsis);
+let got = new Map(), listenError = '';
+try { got = await listen(mmsis); } catch (e) { listenError = e.message || String(e); console.error('Could not listen to aisstream:', listenError); }
+if (seen.size) console.log('AIS message types received:', [...seen].join(', '));
+// a problem the app should show: aisstream refusing the key, or the connection failing outright
+const problem = refused ? `aisstream refused the connection: ${refused}` : listenError ? `Could not reach aisstream: ${listenError}` : '';
 
 const ORDER = { depart: 0, leave12: 1, enter12: 2, arrive: 3 };
 for (const { user, cfg } of tracks) {
   const stateRef = user.collection('aistrack').doc('state');
+  try {
   const prev = (await stateRef.get()).data() || {};
   const g = got.get(cfg.mmsi);
-  const update = { id: 'state', lastRun: now, mmsi: cfg.mmsi };
+  const update = { id: 'state', lastRun: now, mmsi: cfg.mmsi, lastError: problem ? { t: now, message: problem } : null };
   if (!g?.pos || typeof g.pos.lat !== 'number') {
     update.lastNoSignal = now;
     await stateRef.set(update, { merge: true });
@@ -131,5 +151,11 @@ for (const { user, cfg } of tracks) {
   update.fix = fix;
   await stateRef.set(update, { merge: true });
   console.log(`${cfg.vesselName || cfg.mmsi}: ${lat.toFixed(4)}, ${lon.toFixed(4)} · ${fix.inUK ? 'inside' : 'outside'} UK 12 nm${fix.port ? ' · in ' + fix.port : ''}${events.length ? ' · events: ' + events.map(e => e.type).join(', ') : ''}`);
+  } catch (e) {
+    // keep going for other users, and leave a note the app can show
+    console.error(`${cfg.vesselName || cfg.mmsi}: ${e.stack || e}`);
+    try { await stateRef.set({ id: 'state', lastRun: now, lastError: { t: now, message: String(e.message || e) } }, { merge: true }); } catch {}
+  }
 }
+if (problem) console.error(problem);
 process.exit(0);
