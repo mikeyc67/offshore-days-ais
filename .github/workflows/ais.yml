@@ -2,7 +2,7 @@ name: AIS tracker
 
 on:
   schedule:
-    - cron: '7 * * * *'   # every hour, at 7 minutes past (the top of the hour is GitHub's busiest time)
+      - cron: '7 * * * *'   # every hour at 7 minutes past  
   workflow_dispatch:       # adds a "Run workflow" button for testing
 
 jobs:
