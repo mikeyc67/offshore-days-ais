@@ -1,0 +1,9 @@
+{
+  "name": "offshore-days-ais",
+  "private": true,
+  "type": "module",
+  "description": "Hourly AIS check for the Offshore Days Tracker app",
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}
