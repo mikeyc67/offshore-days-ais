@@ -124,6 +124,8 @@ for (const { user, cfg } of tracks) {
   const update = { id: 'state', lastRun: now, mmsi: cfg.mmsi, lastError: problem ? { t: now, message: problem } : null };
   if (!g?.pos || typeof g.pos.lat !== 'number') {
     update.lastNoSignal = now;
+    // a remembered position from a different ship (e.g. after a test) shouldn't be shown as this one's
+    if (prev.fix && prev.fix.mmsi !== cfg.mmsi) update.fix = null;
     await stateRef.set(update, { merge: true });
     console.log(`${cfg.vesselName || cfg.mmsi}: no AIS position this hour (normal well offshore).`);
     continue;
@@ -131,12 +133,15 @@ for (const { user, cfg } of tracks) {
   const { lat, lon, sog, nav } = g.pos;
   const port = portAt(lat, lon, sog, nav);
   const fix = {
+    mmsi: cfg.mmsi,
     t: g.pos.t || now, lat, lon, sog, nav,
     inUK: inUK(lat, lon),
     port: port ? port.name : null, portUK: port ? !!port.uk : null,
     dest: g.dest || prev.fix?.dest || '',
   };
-  const last = prev.mmsi === cfg.mmsi ? prev.fix : null;   // a new ship starts fresh
+  // compare only with this ship's own last position (after switching ships, or from older
+  // records that don't say which ship they were, start fresh rather than invent a departure)
+  const last = prev.fix && prev.fix.mmsi === cfg.mmsi ? prev.fix : null;
   const events = [];
   if (last) {
     if (last.port && last.port !== fix.port) events.push({ type: 'depart', port: last.port, portUK: last.portUK, after: last.t, t: fix.t, lat: last.lat, lon: last.lon });
