@@ -1,0 +1,21 @@
+name: AIS tracker
+
+on:
+  schedule:
+    - cron: '7 * * * *'   # every hour, at 7 minutes past (the top of the hour is GitHub's busiest time)
+  workflow_dispatch:       # adds a "Run workflow" button for testing
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --omit=dev --no-audit --no-fund
+      - run: node track.mjs
+        env:
+          AISSTREAM_KEY: ${{ secrets.AISSTREAM_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
