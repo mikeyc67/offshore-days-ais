@@ -9,7 +9,8 @@ import { readFileSync } from 'node:fs';
 const UK = JSON.parse(readFileSync(new URL('./uk12.json', import.meta.url)));
 const PORTS = JSON.parse(readFileSync(new URL('./ports.json', import.meta.url)));
 const KEY = process.env.AISSTREAM_KEY;
-const LISTEN_MS = Number(process.env.LISTEN_SECONDS || 150) * 1000;
+// a moored or anchored ship only reports its position every 3 minutes, so listen long enough to hear two
+const LISTEN_MS = Number(process.env.LISTEN_SECONDS || 400) * 1000;
 const PORT_RADIUS_NM = 4;
 
 // never let one odd message end the whole run
@@ -100,14 +101,17 @@ function listen(mmsis) {
 // ---- main ----
 const now = new Date().toISOString();
 const tracks = [];
+const fleets = [];   // every saved vessel with an MMSI, so the app can tell when you're next to one in port
 for (const user of await db.collection('users').listDocuments()) {
   const snap = await user.collection('aistrack').doc('current').get();
   const cfg = snap.exists ? snap.data() : null;
   if (cfg?.active && /^\d{9}$/.test(String(cfg.mmsi || ''))) tracks.push({ user, cfg: { ...cfg, mmsi: String(cfg.mmsi) } });
+  const vessels = (await user.collection('vessels').get()).docs.map(d => d.data()).filter(v => /^\d{9}$/.test(String(v.mmsi || '')));
+  if (vessels.length) fleets.push({ user, vessels });
 }
-if (!tracks.length) { console.log('Nobody has tracking switched on. Nothing to do.'); process.exit(0); }
+if (!tracks.length && !fleets.length) { console.log('Nobody has tracking switched on or a vessel with an MMSI. Nothing to do.'); process.exit(0); }
 
-const mmsis = [...new Set(tracks.map(t => t.cfg.mmsi))];
+const mmsis = [...new Set([...tracks.map(t => t.cfg.mmsi), ...fleets.flatMap(f => f.vessels.map(v => String(v.mmsi)))])];
 console.log(`Listening up to ${LISTEN_MS / 1000}s for ${mmsis.length} vessel(s)…`);
 let got = new Map(), listenError = '';
 try { got = await listen(mmsis); } catch (e) { listenError = e.message || String(e); console.error('Could not listen to aisstream:', listenError); }
@@ -160,6 +164,22 @@ for (const { user, cfg } of tracks) {
     // keep going for other users, and leave a note the app can show
     console.error(`${cfg.vesselName || cfg.mmsi}: ${e.stack || e}`);
     try { await stateRef.set({ id: 'state', lastRun: now, lastError: { t: now, message: String(e.message || e) } }, { merge: true }); } catch {}
+  }
+}
+// latest position of each saved vessel heard this run (the last known one is kept otherwise)
+for (const { user, vessels } of fleets) {
+  for (const v of vessels) {
+    const g = got.get(String(v.mmsi));
+    if (!g?.pos || typeof g.pos.lat !== 'number') continue;
+    const { lat, lon, sog, nav } = g.pos;
+    const port = portAt(lat, lon, sog, nav);
+    try {
+      await user.collection('aisfleet').doc(String(v.mmsi)).set({
+        id: String(v.mmsi), mmsi: String(v.mmsi), vessel: v.name || '', t: g.pos.t || now, lat, lon, sog, nav,
+        port: port ? port.name : null, portUK: port ? !!port.uk : null, inUK: inUK(lat, lon),
+      });
+      console.log(`Fleet: ${v.name || v.mmsi} at ${lat.toFixed(4)}, ${lon.toFixed(4)}${port ? ' · in ' + port.name : ''}`);
+    } catch (e) { console.error(`Fleet: ${v.name || v.mmsi}: ${e.message || e}`); }
   }
 }
 if (problem) console.error(problem);
