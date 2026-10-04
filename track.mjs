@@ -54,6 +54,13 @@ function aisTime(s) {
   return m ? `${m[1]}T${m[2]}Z` : null;
 }
 
+// how far a time is from midnight in the UK (minutes), allowing for BST
+function minutesFromUkMidnight(iso) {
+  const p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso));
+  const m = Number(p.find(x => x.type === 'hour').value) * 60 + Number(p.find(x => x.type === 'minute').value);
+  return Math.min(m, 1440 - m);
+}
+
 // ---- listen to aisstream for these MMSIs until each has reported a position, or time runs out ----
 const seen = new Set();   // message types received, for the log
 let refused = '';          // aisstream's reason, if it turned the connection down
@@ -159,6 +166,10 @@ for (const { user, cfg } of tracks) {
   }
   update.fix = fix;
   await stateRef.set(update, { merge: true });
+  // positions near UK midnight are kept, so the app can check them against the midnight-positions sheet
+  if (minutesFromUkMidnight(fix.t) <= 90) {
+    await user.collection('aisfixes').doc(`${cfg.mmsi}-${fix.t}`).set({ id: `${cfg.mmsi}-${fix.t}`, mmsi: cfg.mmsi, vessel: cfg.vesselName || '', t: fix.t, lat, lon, inUK: fix.inUK });
+  }
   console.log(`${cfg.vesselName || cfg.mmsi}: ${lat.toFixed(4)}, ${lon.toFixed(4)} · ${fix.inUK ? 'inside' : 'outside'} UK 12 nm${fix.port ? ' · in ' + fix.port : ''}${events.length ? ' · events: ' + events.map(e => e.type).join(', ') : ''}`);
   } catch (e) {
     // keep going for other users, and leave a note the app can show
